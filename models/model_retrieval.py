@@ -13,7 +13,7 @@ class ALBEF(nn.Module):
                  config = None,     
                  ):
         super().__init__()
-        self.dist = config['dist']
+        self.dist = config.distributed
         self.tokenizer = tokenizer 
         self.distill = config['distill']
         embed_dim = config['embed_dim']        

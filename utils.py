@@ -1,12 +1,128 @@
-import numpy as np
-import io
+import datetime
+import json
+import logging
+import logging.config
 import os
+import random
+import shutil
 import time
 from collections import defaultdict, deque
-import datetime
+from pathlib import Path
 
+import numpy as np
+import ruamel.yaml as yaml
 import torch
 import torch.distributed as dist
+from torch.utils.tensorboard import SummaryWriter
+import subprocess
+
+def run_git_command(git_command, repo_path):
+    # 使用 -C 选项指定仓库路径
+    command = ['git', '-C', repo_path] + git_command
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return result.stdout.strip()
+
+def is_git_repository(folder_path):
+    git_directory = os.path.join(folder_path, '.git')
+    return os.path.isdir(git_directory)
+
+def get_git_info(repo_path):
+    current_branch, git_info = 'Unknown', f"{repo_path} is not a git repo!"
+    if is_git_repository(repo_path):
+        current_branch = run_git_command(['rev-parse', '--abbrev-ref', 'HEAD'], repo_path)
+        git_info = "/n".join([run_git_command(['branch', '-av'], repo_path),
+                              run_git_command(['diff'], repo_path)
+                              ])
+    return current_branch.replace(" ", "_"), git_info
+
+def read_yaml(path):
+    config = yaml.load(open(path, 'r'), Loader=yaml.Loader)
+    return config
+
+def compose_new_attr(logger, logging_level, is_master=False):
+
+    logging_origin = logger.__getattribute__(logging_level)
+
+    def dist_logger(*args, **kwargs):
+        force = kwargs.pop('force', False)
+        if is_master or force:
+            logging_origin(*args, **kwargs)
+
+    logger.__setattr__(logging_level, dist_logger)
+
+
+def setup_for_distributed_logger(logger, is_master=False):
+    """
+    This function disables logging when not in master process
+    """
+    levelToName = {50: 'CRITICAL', 40: 'ERROR', 30: 'WARNING', 20: 'INFO', 10: 'DEBUG'}
+    for level, name in levelToName.items():
+        compose_new_attr(logger, name.lower(), is_master)
+
+
+def create_logger(config):
+    """
+    This function is responsible for creating the log folder,and returning the class used for logging operations.
+    The log file is recorded according to the timing, and records each training process independently.
+    https://zhuanlan.zhihu.com/p/476549020
+    https://blog.csdn.net/dadaowuque/article/details/104527196
+    https://www.cnblogs.com/liqi175/p/16557213.html
+
+    args:
+    --------
+        config -> config dictionary which contains log path and setting.
+    
+    returns:
+    --------
+        logger -> a handler that can perform log operations;
+        # sub_output_path -> final output directory depend on timestamp.
+
+    structure:
+    --------
+        /root -> name according to settings + git branch name + timestamp
+            
+            /checkpoints -> big files
+                ...
+
+            tensorboard.logs
+
+            logging file
+
+            global_config.yaml
+            ...
+    """
+    output_path = os.path.join(config.output_dir, config.current_branch, time.strftime('%Y-%m-%d-%H-%M'))
+    ckpt_output_path = os.path.join(output_path, 'checkpoints')
+    config.output_dir = output_path
+    config.ckpt_output_path = ckpt_output_path
+
+    if is_main_process():
+        Path(output_path).mkdir(parents=True, exist_ok=True)
+        Path(ckpt_output_path).mkdir(parents=True, exist_ok=True)
+        yaml.dump(dict(config), open(os.path.join(config.output_dir, 'global_config.yaml'), 'w'))
+
+    if is_dist_avail_and_initialized():
+        torch.distributed.barrier()
+
+    tb_writer = tbWriter(output_path)
+
+    log_file = 'train.log'
+    head = '%(asctime)s - %(levelname)s - %(message)s'
+    formatter = logging.Formatter(head)
+    logger = logging.getLogger()
+    fh = logging.FileHandler(os.path.join(output_path, log_file))
+    ch = logging.StreamHandler()
+    ch.setFormatter(formatter)
+    fh.setFormatter(formatter)
+    logging_level = getattr(logging, config.logging_level, logging.DEBUG)
+    ch.setLevel(logging_level)
+    fh.setLevel(logging_level)
+    logger.addHandler(ch)
+    logger.addHandler(fh)
+    logger.setLevel(logging_level)
+
+    setup_for_distributed_logger(logger, is_master=is_main_process())
+    return logger, tb_writer
 
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
@@ -35,9 +151,11 @@ class SmoothedValue(object):
         t = torch.tensor([self.count, self.total], dtype=torch.float64, device='cuda')
         dist.barrier()
         dist.all_reduce(t)
+        t /= get_world_size()
         t = t.tolist()
-        self.count = int(t[0])
-        self.total = t[1]
+        count, total = t
+        self.count = int(count)
+        self.total = total
 
     @property
     def median(self):
@@ -51,7 +169,7 @@ class SmoothedValue(object):
 
     @property
     def global_avg(self):
-        return self.total / self.count
+        return self.total / (self.count + 1e-6)
 
     @property
     def max(self):
@@ -60,6 +178,10 @@ class SmoothedValue(object):
     @property
     def value(self):
         return self.deque[-1]
+
+    @property
+    def empty(self):
+        return self.deque.__len__() == 0
 
     def __str__(self):
         return self.fmt.format(
@@ -71,9 +193,10 @@ class SmoothedValue(object):
 
 
 class MetricLogger(object):
-    def __init__(self, delimiter="\t"):
+    def __init__(self, logging=None, delimiter="\t"):
         self.meters = defaultdict(SmoothedValue)
         self.delimiter = delimiter
+        self.logging = logging if logging else print
 
     def update(self, **kwargs):
         for k, v in kwargs.items():
@@ -98,14 +221,34 @@ class MetricLogger(object):
             )
         return self.delimiter.join(loss_str)
 
-    def global_avg(self):
-        loss_str = []
+    def summary(self, mode="avg"):
+        """
+        Determine how to count the variables in meters by specifying the mode.
+        My annotation is of a kind of very exhautive numpydoc format docstring. 
+        See: https://zhuanlan.zhihu.com/p/344543685
+
+        args:
+        --------
+            mode -> ["avg", "global_avg", "max", "median", "total", "value"], Optional, by default "avg"
+                    
+        return:
+        --------
+            A summary string for multiple variables in MetricLogger.
+        """
+        summary_str = []
         for name, meter in self.meters.items():
-            loss_str.append(
-                "{}: {:.4f}".format(name, meter.global_avg)
+            summary_str.append(
+                "{}: {}".format(name, getattr(meter, mode))
             )
-        return self.delimiter.join(loss_str)    
+        return self.delimiter.join(summary_str)    
     
+    def latest_meter(self, prefix=''):
+        latest = {}
+        for name, meter in self.meters.items():
+            latest.update({prefix + name : getattr(meter, "value")})
+        return latest
+
+
     def synchronize_between_processes(self):
         for meter in self.meters.values():
             meter.synchronize_between_processes()
@@ -113,12 +256,9 @@ class MetricLogger(object):
     def add_meter(self, name, meter):
         self.meters[name] = meter
 
-    def log_every(self, iterable, print_freq, header=None):
+    def log_every(self, iterable, print_freq=50, header=None):
         i = 0
-        if not header:
-            header = ''
-        start_time = time.time()
-        end = time.time()
+        header = header if header else ''
         iter_time = SmoothedValue(fmt='{avg:.4f}')
         data_time = SmoothedValue(fmt='{avg:.4f}')
         space_fmt = ':' + str(len(str(len(iterable)))) + 'd'
@@ -127,36 +267,43 @@ class MetricLogger(object):
             '[{0' + space_fmt + '}/{1}]',
             'eta: {eta}',
             '{meters}',
-            'time: {time}',
-            'data: {data}'
+            'step: {time} s',
+            'item: {data} s'
         ]
         if torch.cuda.is_available():
-            log_msg.append('max mem: {memory:.0f}')
+            log_msg.append('memory: {memory:.0f}/MB')
         log_msg = self.delimiter.join(log_msg)
         MB = 1024.0 * 1024.0
+        start_time = time.time()
+        end = time.time()
         for obj in iterable:
             data_time.update(time.time() - end)
-            yield obj
-            iter_time.update(time.time() - end)
-            if i % print_freq == 0 or i == len(iterable) - 1:
-                eta_seconds = iter_time.global_avg * (len(iterable) - i)
-                eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
+            i += 1
+            if i == 1 or i % print_freq == 0 or i == len(iterable):
+                if iter_time.empty:
+                    eta_string = iter_time_str = meters = None
+                else:
+                    eta_seconds = iter_time.global_avg * (len(iterable) - i)
+                    eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
+                    iter_time_str = str(iter_time)
+                    meters = str(self)
                 if torch.cuda.is_available():
-                    print(log_msg.format(
+                    self.logging(log_msg.format(
                         i, len(iterable), eta=eta_string,
-                        meters=str(self),
-                        time=str(iter_time), data=str(data_time),
+                        meters=meters,
+                        time=iter_time_str, data=str(data_time),
                         memory=torch.cuda.max_memory_allocated() / MB))
                 else:
-                    print(log_msg.format(
+                    self.logging(log_msg.format(
                         i, len(iterable), eta=eta_string,
-                        meters=str(self),
-                        time=str(iter_time), data=str(data_time)))
-            i += 1
+                        meters=meters,
+                        time=iter_time_str, data=str(data_time)))
+            yield obj
+            iter_time.update(time.time() - end)
             end = time.time()
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        print('{} Total time: {} ({:.4f} s / it)'.format(
+        self.logging('{} Total time: {} ({:.4f} s / it)'.format(
             header, total_time_str, total_time / len(iterable)))
         
 
@@ -258,10 +405,12 @@ def init_distributed_mode(args):
     setup_for_distributed(args.rank == 0)
 
 @torch.no_grad()
-def concat_all_gather(tensor,dist=True):
-    if dist:
+def concat_all_gather(tensor):
+    if is_dist_avail_and_initialized():
         """
+        https://zhuanlan.zhihu.com/p/250471767
         Performs all_gather operation on the provided tensors.
+        https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_gather
         *** Warning ***: torch.distributed.all_gather has no gradient.
         """
         tensors_gather = [torch.ones_like(tensor)
@@ -272,3 +421,70 @@ def concat_all_gather(tensor,dist=True):
         return output        
     else :
         return tensor
+        
+def setup_seed(seed=3407):
+    # fix the seed for reproducibility, more details see:
+    # https://www.zhihu.com/search?type=content&q=3407
+    # https://blog.csdn.net/zxyhhjs2017/article/details/91348108
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    # seed = seed + get_rank()
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    np.random.seed(seed)
+    random.seed(seed)
+
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.enabled = False
+    ...
+
+def prepare_input(data, device):
+    """
+    Prepares one `data` before feeding it to the model, be it a tensor or a nested list/dictionary of tensors.
+    Copy from huggingface trainer.py
+    """
+    from collections.abc import Mapping
+    if isinstance(data, Mapping):
+        return AttrDict(type(data)({k: prepare_input(v, device) for k, v in data.items()}))
+    elif isinstance(data, (tuple, list)):
+        return type(data)(prepare_input(v) for v in data)
+    elif isinstance(data, torch.Tensor):
+        return data.to(device, non_blocking=True)
+    return data
+
+def copy_whole_dir(source_path, target_path):
+
+    if not os.path.exists(target_path):
+        Path(target_path).mkdir(parents=True, exist_ok=True)
+
+    if os.path.exists(source_path):
+        shutil.rmtree(target_path)
+    
+    shutil.copytree(source_path, target_path)
+
+def write_json(target_path, target_name, json_file):
+
+    Path(target_path).mkdir(parents=True, exist_ok=True)
+    with open(os.path.join(target_path, f"{target_name}.json"), "w") as f:
+        f.write(json.dumps(json_file, ensure_ascii=False, indent=4))
+
+class tbWriter:
+
+    def __init__(self, output_dir):
+        self.output_dir = output_dir
+        self.writer = SummaryWriter(log_dir=self.output_dir) 
+
+    def add_scalar(self, name,  value, step):
+        if not is_main_process():
+            return
+        self.writer.add_scalar(name, value, step)
+
+    def add_dict_scalar(self, dct_var, step):
+        for k, v in dct_var.items():
+            self.add_scalar(k, v, step)
+
+    def close(self):
+        self.writer.close()
