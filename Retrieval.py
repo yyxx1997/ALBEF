@@ -69,7 +69,7 @@ def train(model, model_without_ddp, train_loader, val_loader, test_loader, train
             text_input = tokenizer(text, padding='longest', max_length=30, return_tensors="pt").to(device)  
 
             alpha = config['alpha'] 
-            if epoch == 0 and config['warm_up']:
+            if epoch == start_epoch and config['warm_up']:
                 alpha *= min(1, i/len(train_loader))
 
             sync_context = model.no_sync if config.local_rank != -1 and (i + 1) % K != 0 else nullcontext
@@ -362,7 +362,7 @@ def main():
 
     #### Dataset ####
     logger.info("- - - - - - - - - - - - - Creating dataset- - - - - - - - - - - - - ")
-    train_dataset, val_dataset, test_dataset = create_dataset('re', config)  
+    train_dataset, val_dataset, test_dataset = create_dataset(config.mode, config)  
 
     if config.distributed:
         num_tasks = utils.get_world_size()
@@ -375,7 +375,7 @@ def main():
                                                           batch_size=[config['batch_size_train']]+[config['batch_size_test']]*2,
                                                           num_workers=[4,4,4],
                                                           is_trains=[True, False, False], 
-                                                          collate_fns=[None, None, None])    
+                                                          collate_fns=[train_dataset.collate_fn, None, None])    
     # next(iter(train_loader))
     tokenizer = BertTokenizer.from_pretrained(config.text_encoder)
 
@@ -437,7 +437,10 @@ def main():
 def parse_args():
     parser = argparse.ArgumentParser(
         description="necessarily parameters for run this code."
-    )     
+    )  
+    parser.add_argument('--mix_rate', default=0.25, type=float,help='Mixup generation portion.')
+    parser.add_argument('--mix_lam', default=0.5, type=float,help='Mixup generation lambda.')
+    parser.add_argument('--mode', type=str, choices=['re','mixgen','mixgen_batch','mixgen_random'], default='re', help="Selection of mixgen mode.")    
     parser.add_argument('--config', default='./configs/Retrieval_coco.yaml')
     parser.add_argument('--output_dir', default='../Output/ALBEF/Retrieval_coco')        
     parser.add_argument('--checkpoint', default='../Models/ALBEF/ALBEF_4M.pth')   
@@ -484,7 +487,7 @@ if __name__ == '__main__':
     config.current_branch = current_branch
     logger, tb_writer = utils.create_logger(config)
 
-    logger.info(f"Here is all global configuration:\n {str(config)}")
-    logger.info(f"Here is all git repo infomation:\n {git_info}")
+    logger.info(f"Here is all global configuration: {str(config)}")
+    logger.info(f"Here is all git repo infomation: {git_info}")
 
     main()
