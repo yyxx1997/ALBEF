@@ -440,7 +440,7 @@ def parse_args():
     )  
     parser.add_argument('--mix_rate', default=0.25, type=float,help='Mixup generation portion.')
     parser.add_argument('--mix_lam', default=0.5, type=float,help='Mixup generation lambda.')
-    parser.add_argument('--mode', type=str, choices=['re','mixgen','mixgen_batch','mixgen_random'], default='re', help="Selection of mixgen mode.")    
+    parser.add_argument('--mode', type=str, choices=['re','mixgen','mixgen_batch','mixgen_random', 'mixgen_clip_score'], default='re', help="Selection of mixgen mode.")  
     parser.add_argument('--config', default='./configs/Retrieval_coco.yaml')
     parser.add_argument('--output_dir', default='../Output/ALBEF/Retrieval_coco')        
     parser.add_argument('--checkpoint', default='../Models/ALBEF/ALBEF_4M.pth')   

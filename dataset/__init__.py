@@ -27,6 +27,8 @@ def create_dataset(mode, config):
     
     if mode == 're': 
         train_dataset = re_train_dataset(config['train_file'], train_transform, config['image_root'])     
+    elif mode == "mixgen_clip_score":
+        train_dataset = re_train_dataset_cscore(config['train_file'], config['train_clip_score_file'], train_transform, config['image_root'], config.mix_rate, config.mix_lam)
     else:          
         train_dataset = re_train_dataset_mixgen(config['train_file'], train_transform, config['image_root'], config.mix_rate, config.mix_lam, mode)
     
